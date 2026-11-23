@@ -43,14 +43,6 @@ const CHIPS = [
    1. with server.py (local / any host that runs Python) through /api/*,
    2. as plain static files (GitHub Pages) by calling the API directly. */
 const UPSTREAM = "https://saavn.sumit.co/api";
-const CATALOGUE_TIMEOUT = 15000;
-
-/* Direct first; if a network blocks the catalogue host, retry through a
-   public CORS relay so the app still works on GitHub Pages. */
-const ROUTES = [
-  (url) => url,
-  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-];
 const HOME_SECTIONS = [
   { id: "fresh", title: "Fresh releases", subtitle: "New Hindi songs everyone is playing", query: "latest hindi hits" },
   { id: "romance", title: "Bollywood romance", subtitle: "Soft, slow and full of feeling", query: "romantic hindi songs" },
@@ -61,7 +53,6 @@ const HOME_SECTIONS = [
 ];
 
 let hasBackend = true;
-let catalogueError = "";
 
 /* ------------------------------------------------------------ utilities ---- */
 function esc(value) {
@@ -138,101 +129,56 @@ function normalizeSong(entry) {
   };
 }
 
-/* One request with a timeout plus one retry — mobile networks hiccup a lot. */
-function friendlyError(error) {
-  const text = String((error && error.message) || error || "");
-  if (/abort|timed out|timeout/i.test(text)) return "The request timed out.";
-  if (/failed to fetch|networkerror|load failed/i.test(text)) return "The network request was blocked.";
-  return text || "Network request failed.";
-}
-
-async function getJSON(url, attempts = 2, timeout = CATALOGUE_TIMEOUT) {
-  let lastError = null;
-
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const controller = typeof AbortController === "function" ? new AbortController() : null;
-    const timer = controller ? setTimeout(() => controller.abort(), timeout) : null;
-    const target = attempt === 0 ? url : `${url}${url.includes("?") ? "&" : "?"}_=${Date.now()}`;
-
-    try {
-      const response = await fetch(target, {
-        headers: { Accept: "application/json" },
-        cache: "no-store",
-        signal: controller ? controller.signal : undefined,
-      });
-      if (!response.ok) throw new Error(`Catalogue responded ${response.status}.`);
-      return await response.json();
-    } catch (error) {
-      lastError = error;
-      if (attempt + 1 < attempts) await new Promise((done) => setTimeout(done, 600));
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
-
-  throw lastError || new Error("The catalogue is unreachable right now.");
-}
-
 async function fetchSongs(query, limit = 30) {
   if (hasBackend) {
     try {
-      const body = await getJSON(`/api/search?q=${encodeURIComponent(query)}&limit=${limit}`, 1);
-      if (Array.isArray(body.items)) return body.items;
-      hasBackend = false;
+      const response = await fetch(
+        `/api/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+        { headers: { Accept: "application/json" } }
+      );
+      if (response.ok) {
+        const body = await response.json();
+        if (Array.isArray(body.items)) return body.items;
+      } else {
+        hasBackend = false;
+      }
     } catch (error) {
       hasBackend = false;
     }
   }
 
-  const target = `${UPSTREAM}/search/songs?query=${encodeURIComponent(query)}&limit=${limit}`;
-  let lastError = null;
-
-  for (let index = 0; index < ROUTES.length; index += 1) {
-    try {
-      const body = await getJSON(ROUTES[index](target), index === 0 ? 2 : 1, index === 0 ? CATALOGUE_TIMEOUT : 12000);
-      const results = (body && body.data && body.data.results) || [];
-      const songs = results.map(normalizeSong).filter((song) => song.url && song.title);
-      if (songs.length) return songs;
-      lastError = new Error("The catalogue returned no songs.");
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError || new Error("The catalogue is unreachable right now.");
+  const url = `${UPSTREAM}/search/songs?query=${encodeURIComponent(query)}&limit=${limit}`;
+  const response = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!response.ok) throw new Error("The catalogue is unreachable right now.");
+  const body = await response.json();
+  const results = (body.data && body.data.results) || [];
+  return results.map(normalizeSong).filter((song) => song.url && song.title);
 }
 
 async function fetchHomeSections() {
   if (hasBackend) {
     try {
-      const body = await getJSON("/api/home", 1);
-      if (Array.isArray(body.sections) && body.sections.length) return body.sections;
-      hasBackend = false;
+      const response = await fetch("/api/home", { headers: { Accept: "application/json" } });
+      if (response.ok) {
+        const body = await response.json();
+        if (Array.isArray(body.sections) && body.sections.length) return body.sections;
+      } else {
+        hasBackend = false;
+      }
     } catch (error) {
       hasBackend = false;
     }
   }
 
-  /* Static hosting (GitHub Pages): build the sections straight from the API.
-     Loaded in small batches so a phone on mobile data is not swamped. */
-  const sections = [];
-  catalogueError = "";
-
-  for (let start = 0; start < HOME_SECTIONS.length; start += 3) {
-    const batch = HOME_SECTIONS.slice(start, start + 3);
-    const filled = await Promise.all(
-      batch.map(async (section) => {
-        try {
-          return { ...section, items: await fetchSongs(section.query, 12) };
-        } catch (error) {
-          if (!catalogueError) catalogueError = friendlyError(error);
-          return { ...section, items: [] };
-        }
-      })
-    );
-    sections.push(...filled);
-  }
-
+  const sections = await Promise.all(
+    HOME_SECTIONS.map(async (section) => {
+      try {
+        return { ...section, items: await fetchSongs(section.query, 12) };
+      } catch (error) {
+        return { ...section, items: [] };
+      }
+    })
+  );
   return sections.filter((section) => section.items.length);
 }
 
@@ -337,22 +283,10 @@ function rowHTML(track, i) {
   </li>`;
 }
 
-function homeErrorText() {
-  if (location.protocol === "file:") {
-    return "This page was opened as a downloaded file, so it cannot reach the music catalogue. Open the GitHub Pages link instead.";
-  }
-  if (!navigator.onLine) return "Your phone is offline. Connect to the internet and tap Try again.";
-  if (catalogueError) return `The music catalogue did not respond (${catalogueError}) Tap Try again.`;
-  return "No songs came back from the catalogue. Tap Try again.";
-}
-
 function renderHome() {
   const wrap = $("homeSections");
   if (!homeSections.length) {
-    wrap.innerHTML = `<div class="home-error">
-      <p class="loading">${esc(homeErrorText())}</p>
-      <button class="chip" type="button" data-retry>Try again</button>
-    </div>`;
+    wrap.innerHTML = '<p class="loading">No songs loaded. Check your connection and reload.</p>';
     return;
   }
   wrap.innerHTML = homeSections.map((section) => `
@@ -542,16 +476,11 @@ function closeSheet() {
 }
 
 /* ------------------------------------------------------------------- init ---- */
-async function loadHome(retry) {
-  const wrap = $("homeSections");
-  if (!homeSections.length) {
-    wrap.innerHTML = `<p class="loading">${retry ? "Trying the catalogue again…" : "Loading songs…"}</p>`;
-  }
+async function loadHome() {
   try {
     homeSections = await fetchHomeSections();
   } catch (error) {
     homeSections = [];
-    catalogueError = friendlyError(error);
   }
   renderHome();
 }
@@ -565,10 +494,6 @@ function bind() {
   });
 
   $("homeSections").addEventListener("click", (event) => {
-    if (event.target.closest("[data-retry]")) {
-      loadHome(true);
-      return;
-    }
     const card = event.target.closest(".card");
     if (!card) return;
     const section = homeSections.find((item) => item.id === card.dataset.section);
